@@ -149,12 +149,17 @@ class StreamProcessor:
             try:
                 while True:
                     try:
-                        audio_chunk = process.stdout.read(chunk_size)
+                        loop = asyncio.get_event_loop()
+                        audio_chunk = await loop.run_in_executor(None, process.stdout.read, chunk_size)
+                        self.logger.info(f"Read {len(audio_chunk)} bytes from ffmpeg")
                         if not audio_chunk:
                             self.logger.warning("No more audio data received")
                             break
                         
                         audio_buffer.extend(audio_chunk)
+                        self.logger.debug(f"Audio buffer size after extend: {len(audio_buffer)}")
+                        
+                        current_time = datetime.now()
                         
                         if len(audio_buffer) >= min_buffer_size:
                             self.logger.debug(f"Processing audio buffer of size: {len(audio_buffer)}")
@@ -175,10 +180,9 @@ class StreamProcessor:
                                         file_handles['transcript'].write(
                                             f"{datetime.now()}: {cleaned_transcription}\n")
                                         file_handles['transcript'].flush()
-                                
-                        audio_buffer = audio_buffer[-overlap_size:]
-                        
-                        current_time = datetime.now()
+                            
+                            audio_buffer = audio_buffer[-overlap_size:]
+                            self.logger.debug(f"Audio buffer size after overlap: {len(audio_buffer)}")
                         
                         if current_time - self.last_summary_time >= self.summary_interval:
                             self.logger.info("Generating interval summary...")
@@ -264,13 +268,29 @@ class StreamProcessor:
             additional_headers=headers
         )
 
+    async def _ensure_websocket(self, websocket):
+        """Ensure we have a working websocket connection"""
+        try:
+            if websocket and websocket.state == websockets.protocol.State.OPEN:
+                return websocket
+            if websocket:
+                try:
+                    await websocket.close()
+                except:
+                    pass
+            return await self._connect_websocket()
+        except Exception as e:
+            self.logger.error(f"Error ensuring websocket connection: {e}")
+            return await self._connect_websocket()
+
     async def _generate_interval_summary(self, interval_file, current_file, websocket):
         """Generate summary for the current interval"""
-        if not self.current_interval_notes:
-            self.logger.info("No notes to summarize for this interval")
-            return
-
         try:
+            websocket = await self._ensure_websocket(websocket)
+            if not self.current_interval_notes:
+                self.logger.info("No notes to summarize for this interval")
+                return
+
             self.logger.info("Generating interval summary...")
             notes_text = "\n".join(
                 f"Time: {note.timestamp}\n"
@@ -387,6 +407,7 @@ class StreamProcessor:
     async def _generate_final_report(self, report_file, websocket):
         """Generate comprehensive final report"""
         try:
+            websocket = await self._ensure_websocket(websocket)
             self.logger.info("Generating final report...")
             summaries_text = "\n".join(
                 f"Period {i+1}: {summary.start_time} to {summary.end_time}\n" +
@@ -441,6 +462,9 @@ class StreamProcessor:
     async def _transcribe_audio(self, audio_chunk, websocket):
         """Send audio chunk to Cloudflare AI for transcription"""
         try:
+            # Create a new websocket connection specifically for transcription
+            transcription_websocket = await self._connect_websocket()
+            
             wav_header = bytes([
                 0x52, 0x49, 0x46, 0x46,  # "RIFF"
                 0x24, 0x00, 0x00, 0x00,  # Chunk size
@@ -481,9 +505,9 @@ class StreamProcessor:
             }
             
             self.logger.debug(f"Sending request: {json.dumps(request)[:200]}...")
-            await websocket.send(json.dumps(request))
+            await transcription_websocket.send(json.dumps(request))
             
-            raw_response = await websocket.recv()
+            raw_response = await transcription_websocket.recv()
             self.logger.debug(f"Received raw response: {raw_response}")
             
             try:
@@ -491,6 +515,8 @@ class StreamProcessor:
             except json.JSONDecodeError as e:
                 self.logger.error(f"Failed to parse response JSON: {e}")
                 return ""
+            finally:
+                await transcription_websocket.close()
             
             self.logger.debug(f"Parsed response: {json.dumps(response)}")
             
@@ -540,6 +566,7 @@ class StreamProcessor:
     async def _generate_enhanced_notes(self, text: str, websocket) -> Optional[Note]:
         """Generate enhanced notes from transcribed text using Cloudflare AI"""
         try:
+            websocket = await self._ensure_websocket(websocket)
             self.logger.debug("Generating enhanced notes...")
             context = "\n".join(
                 f"{item['timestamp']}: {item['text']}" 
