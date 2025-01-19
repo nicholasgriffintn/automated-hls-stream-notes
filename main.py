@@ -113,10 +113,11 @@ class StreamProcessor:
             
             self.logger.info("ffmpeg process started successfully")
             
-            chunk_size = 16000 * 2 * 5
+            # 15 seconds of audio: sample_rate * bytes_per_sample * seconds
+            chunk_size = 16000 * 2 * 15
             audio_buffer = bytearray()
             min_buffer_size = chunk_size
-            overlap_size = chunk_size // 2
+            overlap_size = chunk_size // 2  # 50% overlap
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.last_summary_time = datetime.now()
@@ -276,7 +277,11 @@ class StreamProcessor:
                 response = json.loads(await websocket.recv())
                 
                 if response["type"] == "universal.created":
-                    analysis = json.loads(response["response"]["result"]["response"])
+                    llm_response = response["response"]["result"]["response"]
+                    
+                    json_str = llm_response[llm_response.find('{'):llm_response.rfind('}')+1]
+                    analysis = json.loads(json_str)
+                    
                     summary = IntervalSummary(
                         start_time=self.last_summary_time,
                         end_time=datetime.now(),
