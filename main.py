@@ -86,6 +86,8 @@ class StreamProcessor:
         self.last_summary_time = None
         self.context_buffer = []
         self.context_window_size = 5
+        self.empty_chunk_count = 0
+        self.max_empty_chunks = 5
         
     async def process_stream(self):
         """Main processing loop"""
@@ -152,9 +154,17 @@ class StreamProcessor:
                         loop = asyncio.get_event_loop()
                         audio_chunk = await loop.run_in_executor(None, process.stdout.read, chunk_size)
                         self.logger.info(f"Read {len(audio_chunk)} bytes from ffmpeg")
+                        
                         if not audio_chunk:
-                            self.logger.warning("No more audio data received")
-                            break
+                            self.empty_chunk_count += 1
+                            self.logger.warning(f"No audio data received ({self.empty_chunk_count}/{self.max_empty_chunks})")
+                            if self.empty_chunk_count >= self.max_empty_chunks:
+                                self.logger.error(f"No audio data received for {self.max_empty_chunks} consecutive chunks, stopping...")
+                                break
+                            await asyncio.sleep(1)
+                            continue
+                        
+                        self.empty_chunk_count = 0
                         
                         audio_buffer.extend(audio_chunk)
                         self.logger.debug(f"Audio buffer size after extend: {len(audio_buffer)}")
