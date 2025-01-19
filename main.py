@@ -155,20 +155,22 @@ class StreamProcessor:
                             transcription = await self._transcribe_audio(bytes(audio_buffer))
                             
                             if transcription:
-                                self.logger.debug(f"Transcribed text: {transcription[:100]}...")
-                                self.context_buffer.append({
-                                    'timestamp': datetime.now(),
-                                    'text': transcription
-                                })
-                                self.context_buffer = self.context_buffer[-self.context_window_size:]
-                                
-                                file_handles['transcript'].write(
-                                    f"{datetime.now()}: {transcription}\n")
-                                file_handles['transcript'].flush()
-                                
-                                note = await self._generate_enhanced_notes(transcription)
-                                if note:
-                                    self.current_interval_notes.append(note)
+                                cleaned_transcription = self._clean_transcript(transcription)
+                                if cleaned_transcription:
+                                    self.logger.debug(f"Transcribed text: {cleaned_transcription[:100]}...")
+                                    self.context_buffer.append({
+                                        'timestamp': datetime.now(),
+                                        'text': cleaned_transcription
+                                    })
+                                    self.context_buffer = self.context_buffer[-self.context_window_size:]
+                                    
+                                    file_handles['transcript'].write(
+                                        f"{datetime.now()}: {cleaned_transcription}\n")
+                                    file_handles['transcript'].flush()
+                                    
+                                    note = await self._generate_enhanced_notes(cleaned_transcription)
+                                    if note:
+                                        self.current_interval_notes.append(note)
                             
                             audio_buffer = audio_buffer[-overlap_size:]
                         
@@ -534,6 +536,27 @@ class StreamProcessor:
         except Exception as e:
             self.logger.error(f"Note generation error: {e}", exc_info=True)
             return None
+
+    def _clean_transcript(self, new_text: str) -> str:
+        """Clean up transcribed text by removing overlapping repeated phrases"""
+        if not self.context_buffer:
+            return new_text
+            
+        last_text = self.context_buffer[-1]['text'] if self.context_buffer else ""
+        
+        last_words = last_text.split()
+        new_words = new_text.split()
+        
+        overlap_start = 0
+        for i in range(min(len(last_words), len(new_words))):
+            if last_words[-i-1:] == new_words[:i+1]:
+                overlap_start = i + 1
+        
+        if overlap_start > 0:
+            cleaned_words = new_words[overlap_start:]
+            return " ".join(cleaned_words) if cleaned_words else new_text
+            
+        return new_text
 
 async def main():
     try:
