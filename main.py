@@ -104,7 +104,8 @@ class StreamProcessor:
                     acodec='pcm_s16le',
                     ac=1,
                     ar='16000',
-                    loglevel='error'
+                    loglevel='error',
+                    bufsize='2M'
                 )
                 .overwrite_output()
                 .run_async(pipe_stdout=True, pipe_stderr=True)
@@ -112,9 +113,10 @@ class StreamProcessor:
             
             self.logger.info("ffmpeg process started successfully")
             
-            chunk_size = 16000 * 2 * 3
+            chunk_size = 16000 * 2 * 5
             audio_buffer = bytearray()
-            min_buffer_size = chunk_size * 2
+            min_buffer_size = chunk_size
+            overlap_size = chunk_size // 2
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.last_summary_time = datetime.now()
@@ -137,10 +139,10 @@ class StreamProcessor:
             file_handles = {name: file.open('w', encoding='utf-8') 
                           for name, file in files.items()}
             
+            websocket = await self._connect_websocket()
             try:
                 while True:
                     try:
-                        self.logger.debug("Reading audio chunk...")
                         audio_chunk = process.stdout.read(chunk_size)
                         if not audio_chunk:
                             self.logger.warning("No more audio data received")
@@ -168,7 +170,7 @@ class StreamProcessor:
                                 if note:
                                     self.current_interval_notes.append(note)
                             
-                            audio_buffer = audio_buffer[-chunk_size:]
+                            audio_buffer = audio_buffer[-overlap_size:]
                         
                         current_time = datetime.now()
                         
@@ -194,6 +196,7 @@ class StreamProcessor:
                 self.logger.info("Closing file handles...")
                 for fh in file_handles.values():
                     fh.close()
+                await websocket.close()
                     
         except Exception as e:
             self.logger.error(f"Error processing stream: {e}", exc_info=True)
