@@ -185,7 +185,7 @@ class StreamProcessor:
                             self.logger.debug(f"Audio buffer size after overlap: {len(audio_buffer)}")
                         
                         if current_time - self.last_summary_time >= self.summary_interval:
-                            self.logger.info("Generating interval summary...")
+                            self.logger.info("Starting interval summary generation...")
                             
                             new_transcripts = [
                                 transcript for transcript in self.context_buffer 
@@ -199,10 +199,14 @@ class StreamProcessor:
                                 processed_transcripts.add(transcript['text'])
                             
                             if self.current_interval_notes:
-                                await self._generate_interval_summary(
+                                notes_to_summarize = self.current_interval_notes.copy()
+                                self.current_interval_notes = []
+                                
+                                asyncio.create_task(self._generate_interval_summary_task(
+                                    notes_to_summarize,
                                     file_handles['interval_summaries'],
                                     file_handles['current_summary']
-                                )
+                                ))
                             self.last_summary_time = current_time
                         
                     except KeyboardInterrupt:
@@ -266,123 +270,121 @@ class StreamProcessor:
             additional_headers=headers
         )
 
-    async def _generate_interval_summary(self, interval_file, current_file):
-        """Generate summary for the current interval"""
+    async def _generate_interval_summary_task(self, notes, interval_file, current_file):
+        """Generate summary for the current interval in a separate task"""
         try:
-            if not self.current_interval_notes:
+            if not notes:
                 self.logger.info("No notes to summarize for this interval")
                 return
 
             self.logger.info("Generating interval summary...")
             async with await self._connect_websocket() as websocket:
-              notes_text = "\n".join(
-                  f"Time: {note.timestamp}\n"
-                  f"Content: {note.content}\n"
-                  f"Category: {note.category}\n"
-                  f"Key Points: {', '.join(note.key_points)}\n"
-                  f"Entities: {', '.join(note.entities)}\n"
-                  f"Importance: {note.importance}\n"
-                  for note in self.current_interval_notes
-              )
-              
-              self.logger.debug(f"Generating summary from notes: {notes_text[:200]}...")
-              
-              prompt = f"""
-              Analyze these notes from the last {self.summary_interval.total_seconds() // 60} minutes:
+                notes_text = "\n".join(
+                    f"Time: {note.timestamp}\n"
+                    f"Content: {note.content}\n"
+                    f"Category: {note.category}\n"
+                    f"Key Points: {', '.join(note.key_points)}\n"
+                    f"Entities: {', '.join(note.entities)}\n"
+                    f"Importance: {note.importance}\n"
+                    for note in notes
+                )
+                
+                self.logger.debug(f"Generating summary from notes: {notes_text[:200]}...")
+                
+                prompt = f"""
+                Analyze these notes from the last {self.summary_interval.total_seconds() // 60} minutes:
 
-              {notes_text}
+                {notes_text}
 
-              Create a structured summary including:
-              1. Key points discussed
-              2. Main topics covered
-              3. Important events or decisions
-              4. Action items identified
+                Create a structured summary including:
+                1. Key points discussed
+                2. Main topics covered
+                3. Important events or decisions
+                4. Action items identified
 
-              Format as JSON with structure:
-              {{
-                  "key_points": ["..."],
-                  "main_topics": ["..."],
-                  "important_events": ["..."],
-                  "action_items": ["..."]
-              }}
-              """
-              
-              request = {
-                  "type": "universal.create",
-                  "request": {
-                      "eventId": f"summary_{datetime.now().timestamp()}",
-                      "provider": "workers-ai",
-                      "endpoint": "@cf/meta/llama-2-7b-chat-int8",
-                      "headers": {
-                          "Authorization": f"Bearer {self.cf_token}",
-                          "Content-Type": "application/json",
-                      },
-                      "query": {
-                          "messages": [{"role": "user", "content": prompt}]
-                      }
-                  }
-              }
-              
-              await websocket.send(json.dumps(request))
-              response = json.loads(await websocket.recv())
-              
-              if response["type"] == "universal.created":
-                  llm_response = response["response"]["result"]["response"]
-                  self.logger.debug(f"Raw LLM response: {llm_response[:200]}...")
-                  
-                  json_str = llm_response[llm_response.find('{'):llm_response.rfind('}')+1]
-                  self.logger.debug(f"Extracted JSON: {json_str[:200]}...")
-                  
-                  analysis = json.loads(json_str)
-                  self.logger.debug(f"Parsed analysis: {json.dumps(analysis)[:200]}...")
-                  
-                  summary = IntervalSummary(
-                      start_time=self.last_summary_time,
-                      end_time=datetime.now(),
-                      key_points=analysis.get('key_points', []),
-                      main_topics=analysis.get('main_topics', []),
-                      important_events=analysis.get('important_events', []),
-                      action_items=analysis.get('action_items', [])
-                  )
-                  
-                  interval_file.write(
-                      f"\n{'='*50}\n"
-                      f"Summary for period: {summary.start_time} to {summary.end_time}\n"
-                      f"{'='*50}\n\n"
-                  )
-                  
-                  interval_file.write("Key Points:\n")
-                  for point in summary.key_points:
-                      interval_file.write(f"- {point}\n")
-                      
-                  interval_file.write("\nMain Topics:\n")
-                  for topic in summary.main_topics:
-                      interval_file.write(f"- {topic}\n")
-                      
-                  interval_file.write("\nImportant Events:\n")
-                  for event in summary.important_events:
-                      interval_file.write(f"- {event}\n")
-                      
-                  interval_file.write("\nAction Items:\n")
-                  for item in summary.action_items:
-                      interval_file.write(f"- {item}\n")
-                  
-                  interval_file.write("\n")
-                  interval_file.flush()
-                  
-                  current_file.seek(0)
-                  current_file.truncate()
-                  current_file.write(
-                      f"Current Summary (as of {datetime.now()})\n\n"
-                      f"Key Points:\n"
-                  )
-                  for point in summary.key_points:
-                      current_file.write(f"- {point}\n")
-                  current_file.flush()
-                  
-                  self.all_interval_summaries.append(summary)
-                  
-                  self.current_interval_notes = []
+                Format as JSON with structure:
+                {{
+                    "key_points": ["..."],
+                    "main_topics": ["..."],
+                    "important_events": ["..."],
+                    "action_items": ["..."]
+                }}
+                """
+                
+                request = {
+                    "type": "universal.create",
+                    "request": {
+                        "eventId": f"summary_{datetime.now().timestamp()}",
+                        "provider": "workers-ai",
+                        "endpoint": "@cf/meta/llama-2-7b-chat-int8",
+                        "headers": {
+                            "Authorization": f"Bearer {self.cf_token}",
+                            "Content-Type": "application/json",
+                        },
+                        "query": {
+                            "messages": [{"role": "user", "content": prompt}]
+                        }
+                    }
+                }
+                
+                await websocket.send(json.dumps(request))
+                response = json.loads(await websocket.recv())
+                
+                if response["type"] == "universal.created":
+                    llm_response = response["response"]["result"]["response"]
+                    self.logger.debug(f"Raw LLM response: {llm_response[:200]}...")
+                    
+                    json_str = llm_response[llm_response.find('{'):llm_response.rfind('}')+1]
+                    self.logger.debug(f"Extracted JSON: {json_str[:200]}...")
+                    
+                    analysis = json.loads(json_str)
+                    self.logger.debug(f"Parsed analysis: {json.dumps(analysis)[:200]}...")
+                    
+                    summary = IntervalSummary(
+                        start_time=self.last_summary_time,
+                        end_time=datetime.now(),
+                        key_points=analysis.get('key_points', []),
+                        main_topics=analysis.get('main_topics', []),
+                        important_events=analysis.get('important_events', []),
+                        action_items=analysis.get('action_items', [])
+                    )
+                    
+                    interval_file.write(
+                        f"\n{'='*50}\n"
+                        f"Summary for period: {summary.start_time} to {summary.end_time}\n"
+                        f"{'='*50}\n\n"
+                    )
+                    
+                    interval_file.write("Key Points:\n")
+                    for point in summary.key_points:
+                        interval_file.write(f"- {point}\n")
+                        
+                    interval_file.write("\nMain Topics:\n")
+                    for topic in summary.main_topics:
+                        interval_file.write(f"- {topic}\n")
+                        
+                    interval_file.write("\nImportant Events:\n")
+                    for event in summary.important_events:
+                        interval_file.write(f"- {event}\n")
+                        
+                    interval_file.write("\nAction Items:\n")
+                    for item in summary.action_items:
+                        interval_file.write(f"- {item}\n")
+                    
+                    interval_file.write("\n")
+                    interval_file.flush()
+                    
+                    current_file.seek(0)
+                    current_file.truncate()
+                    current_file.write(
+                        f"Current Summary (as of {datetime.now()})\n\n"
+                        f"Key Points:\n"
+                    )
+                    for point in summary.key_points:
+                        current_file.write(f"- {point}\n")
+                    current_file.flush()
+                    
+                    self.all_interval_summaries.append(summary)
         except Exception as e:
             self.logger.error(f"Error generating interval summary: {e}", exc_info=True)
 
@@ -400,6 +402,10 @@ class StreamProcessor:
                   f"Action Items: {', '.join(summary.action_items)}\n"
                   for i, summary in enumerate(self.all_interval_summaries)
               )
+              
+              if not summaries_text:
+                  self.logger.info("No interval summaries to generate final report")
+                  return
               
               prompt = f"""
               Create a comprehensive final report from these interval summaries:
