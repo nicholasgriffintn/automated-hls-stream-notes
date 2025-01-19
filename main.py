@@ -100,7 +100,7 @@ class StreamProcessor:
                 .input(self.stream_url)
                 .output(
                     'pipe:',
-                    format='wav',
+                    f='wav',
                     acodec='pcm_s16le',
                     ac=1,
                     ar='16000',
@@ -112,7 +112,10 @@ class StreamProcessor:
             
             self.logger.info("ffmpeg process started successfully")
             
-            chunk_size = 4096 * 10
+            chunk_size = 16000 * 2 * 3
+            audio_buffer = bytearray()
+            min_buffer_size = chunk_size * 2
+            
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.last_summary_time = datetime.now()
             
@@ -142,8 +145,31 @@ class StreamProcessor:
                         if not audio_chunk:
                             self.logger.warning("No more audio data received")
                             break
-                        self.logger.debug(f"Read audio chunk of size: {len(audio_chunk)}")
+                        
+                        audio_buffer.extend(audio_chunk)
+                        
+                        if len(audio_buffer) >= min_buffer_size:
+                            self.logger.debug(f"Processing audio buffer of size: {len(audio_buffer)}")
+                            transcription = await self._transcribe_audio(bytes(audio_buffer))
                             
+                            if transcription:
+                                self.logger.debug(f"Transcribed text: {transcription[:100]}...")
+                                self.context_buffer.append({
+                                    'timestamp': datetime.now(),
+                                    'text': transcription
+                                })
+                                self.context_buffer = self.context_buffer[-self.context_window_size:]
+                                
+                                file_handles['transcript'].write(
+                                    f"{datetime.now()}: {transcription}\n")
+                                file_handles['transcript'].flush()
+                                
+                                note = await self._generate_enhanced_notes(transcription)
+                                if note:
+                                    self.current_interval_notes.append(note)
+                            
+                            audio_buffer = audio_buffer[-chunk_size:]
+                        
                         current_time = datetime.now()
                         
                         if current_time - self.last_summary_time >= self.summary_interval:
@@ -154,22 +180,6 @@ class StreamProcessor:
                             )
                             self.last_summary_time = current_time
                         
-                        transcription = await self._transcribe_audio(audio_chunk)
-                        if transcription:
-                            self.logger.debug(f"Transcribed text: {transcription[:100]}...")
-                            self.context_buffer.append({
-                                'timestamp': current_time,
-                                'text': transcription
-                            })
-                            self.context_buffer = self.context_buffer[-self.context_window_size:]
-                            
-                            file_handles['transcript'].write(
-                                f"{current_time}: {transcription}\n")
-                            
-                            note = await self._generate_enhanced_notes(transcription)
-                            if note:
-                                self.current_interval_notes.append(note)
-                    
                     except KeyboardInterrupt:
                         self.logger.info("Received keyboard interrupt, shutting down gracefully...")
                         break
@@ -371,10 +381,27 @@ class StreamProcessor:
     async def _transcribe_audio(self, audio_chunk):
         """Send audio chunk to Cloudflare AI for transcription"""
         try:
+            wav_header = bytes([
+                0x52, 0x49, 0x46, 0x46,  # "RIFF"
+                0x24, 0x00, 0x00, 0x00,  # Chunk size
+                0x57, 0x41, 0x56, 0x45,  # "WAVE"
+                0x66, 0x6D, 0x74, 0x20,  # "fmt "
+                0x10, 0x00, 0x00, 0x00,  # Subchunk1 size
+                0x01, 0x00,              # AudioFormat (PCM)
+                0x01, 0x00,              # NumChannels (1)
+                0x80, 0x3E, 0x00, 0x00,  # SampleRate (16000)
+                0x00, 0x7D, 0x00, 0x00,  # ByteRate
+                0x02, 0x00,              # BlockAlign
+                0x10, 0x00,              # BitsPerSample (16)
+                0x64, 0x61, 0x74, 0x61,  # "data"
+                0x00, 0x00, 0x00, 0x00   # Subchunk2 size
+            ])
+            
+            audio_data = wav_header + audio_chunk
+            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+            
             self.logger.debug("Sending audio chunk for transcription...")
             async with await self._connect_websocket() as websocket:
-                audio_base64 = base64.b64encode(audio_chunk).decode('utf-8')
-                
                 request = {
                     "type": "universal.create",
                     "request": {
@@ -490,7 +517,7 @@ class StreamProcessor:
                 response = json.loads(await websocket.recv())
                 
                 if response["type"] == "universal.created":
-                    analysis = json.loads(response["response"]["result"]["response"])
+                    analysis = response["response"]["result"]
                     return Note(
                         timestamp=datetime.now(),
                         content=analysis.get('summary', ''),
@@ -515,7 +542,7 @@ async def main():
         root_logger = logging.getLogger()
         root_logger.info("Starting application...")
         
-        stream_url = "https://rdmedia.bbc.co.uk/testcard/simulcast/manifests/avc-full.m3u8"
+        stream_url = "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/nonuk/sbr_low/ak/bbc_world_service.m3u8"
         processor = StreamProcessor(stream_url, summary_interval_minutes=5)
         await processor.process_stream()
     except KeyboardInterrupt:
