@@ -31,8 +31,6 @@ class IntervalSummary:
 
 class StreamProcessor:
     def __init__(self, stream_url, output_dir="outputs", summary_interval_minutes=5):
-        load_dotenv()
-        
         self.base_output_dir = Path(output_dir)
         self.base_output_dir.mkdir(exist_ok=True)
         
@@ -51,7 +49,7 @@ class StreamProcessor:
             subdir.mkdir(exist_ok=True)
         
         self.logger = logging.getLogger(f"StreamProcessor_{stream_timestamp}")
-        self.logger.setLevel(logging.ERROR)
+        self.logger.setLevel(logging.INFO)
         
         if not self.logger.handlers:
             file_handler = logging.FileHandler(self.subdirs['logs'] / "process.log")
@@ -160,7 +158,7 @@ class StreamProcessor:
                         
                         if len(audio_buffer) >= min_buffer_size:
                             self.logger.debug(f"Processing audio buffer of size: {len(audio_buffer)}")
-                            transcription = await self._transcribe_audio(bytes(audio_buffer))
+                            transcription = await self._transcribe_audio(bytes(audio_buffer), websocket)
                             
                             if transcription:
                                 cleaned_transcription = self._clean_transcript(transcription)
@@ -191,7 +189,7 @@ class StreamProcessor:
                             ]
                             
                             for transcript in new_transcripts:
-                                note = await self._generate_enhanced_notes(transcript['text'])
+                                note = await self._generate_enhanced_notes(transcript['text'], websocket)
                                 if note:
                                     self.current_interval_notes.append(note)
                                 processed_transcripts.add(transcript['text'])
@@ -199,7 +197,8 @@ class StreamProcessor:
                             if self.current_interval_notes:
                                 await self._generate_interval_summary(
                                     file_handles['interval_summaries'],
-                                    file_handles['current_summary']
+                                    file_handles['current_summary'],
+                                    websocket
                                 )
                             self.last_summary_time = current_time
                         
@@ -219,7 +218,7 @@ class StreamProcessor:
                     ]
                     
                     for transcript in new_transcripts:
-                        note = await self._generate_enhanced_notes(transcript['text'])
+                        note = await self._generate_enhanced_notes(transcript['text'], websocket)
                         if note:
                             self.current_interval_notes.append(note)
                         processed_transcripts.add(transcript['text'])
@@ -227,11 +226,12 @@ class StreamProcessor:
                     if self.current_interval_notes:
                         await self._generate_interval_summary(
                             file_handles['interval_summaries'],
-                            file_handles['current_summary']
+                            file_handles['current_summary'],
+                            websocket
                         )
                 
                 self.logger.info("Generating final report...")
-                await self._generate_final_report(file_handles['final_report'])
+                await self._generate_final_report(file_handles['final_report'], websocket)
                     
             finally:
                 with open(files['transcript_json'], 'a') as f:
@@ -264,7 +264,7 @@ class StreamProcessor:
             additional_headers=headers
         )
 
-    async def _generate_interval_summary(self, interval_file, current_file):
+    async def _generate_interval_summary(self, interval_file, current_file, websocket):
         """Generate summary for the current interval"""
         if not self.current_interval_notes:
             self.logger.info("No notes to summarize for this interval")
@@ -272,175 +272,173 @@ class StreamProcessor:
 
         try:
             self.logger.info("Generating interval summary...")
-            async with await self._connect_websocket() as websocket:
-                notes_text = "\n".join(
-                    f"Time: {note.timestamp}\n"
-                    f"Content: {note.content}\n"
-                    f"Category: {note.category}\n"
-                    f"Key Points: {', '.join(note.key_points)}\n"
-                    f"Entities: {', '.join(note.entities)}\n"
-                    f"Importance: {note.importance}\n"
-                    for note in self.current_interval_notes
-                )
-                
-                self.logger.debug(f"Generating summary from notes: {notes_text[:200]}...")
-                
-                prompt = f"""
-                Analyze these notes from the last {self.summary_interval.total_seconds() // 60} minutes:
+            notes_text = "\n".join(
+                f"Time: {note.timestamp}\n"
+                f"Content: {note.content}\n"
+                f"Category: {note.category}\n"
+                f"Key Points: {', '.join(note.key_points)}\n"
+                f"Entities: {', '.join(note.entities)}\n"
+                f"Importance: {note.importance}\n"
+                for note in self.current_interval_notes
+            )
+            
+            self.logger.debug(f"Generating summary from notes: {notes_text[:200]}...")
+            
+            prompt = f"""
+            Analyze these notes from the last {self.summary_interval.total_seconds() // 60} minutes:
 
-                {notes_text}
+            {notes_text}
 
-                Create a structured summary including:
-                1. Key points discussed
-                2. Main topics covered
-                3. Important events or decisions
-                4. Action items identified
+            Create a structured summary including:
+            1. Key points discussed
+            2. Main topics covered
+            3. Important events or decisions
+            4. Action items identified
 
-                Format as JSON with structure:
-                {{
-                    "key_points": ["..."],
-                    "main_topics": ["..."],
-                    "important_events": ["..."],
-                    "action_items": ["..."]
-                }}
-                """
-                
-                request = {
-                    "type": "universal.create",
-                    "request": {
-                        "eventId": f"summary_{datetime.now().timestamp()}",
-                        "provider": "workers-ai",
-                        "endpoint": "@cf/meta/llama-2-7b-chat-int8",
-                        "headers": {
-                            "Authorization": f"Bearer {self.cf_token}",
-                            "Content-Type": "application/json",
-                        },
-                        "query": {
-                            "messages": [{"role": "user", "content": prompt}]
-                        }
+            Format as JSON with structure:
+            {{
+                "key_points": ["..."],
+                "main_topics": ["..."],
+                "important_events": ["..."],
+                "action_items": ["..."]
+            }}
+            """
+            
+            request = {
+                "type": "universal.create",
+                "request": {
+                    "eventId": f"summary_{datetime.now().timestamp()}",
+                    "provider": "workers-ai",
+                    "endpoint": "@cf/meta/llama-2-7b-chat-int8",
+                    "headers": {
+                        "Authorization": f"Bearer {self.cf_token}",
+                        "Content-Type": "application/json",
+                    },
+                    "query": {
+                        "messages": [{"role": "user", "content": prompt}]
                     }
                 }
+            }
+            
+            await websocket.send(json.dumps(request))
+            response = json.loads(await websocket.recv())
+            
+            if response["type"] == "universal.created":
+                llm_response = response["response"]["result"]["response"]
+                self.logger.debug(f"Raw LLM response: {llm_response[:200]}...")
                 
-                await websocket.send(json.dumps(request))
-                response = json.loads(await websocket.recv())
+                json_str = llm_response[llm_response.find('{'):llm_response.rfind('}')+1]
+                self.logger.debug(f"Extracted JSON: {json_str[:200]}...")
                 
-                if response["type"] == "universal.created":
-                    llm_response = response["response"]["result"]["response"]
-                    self.logger.debug(f"Raw LLM response: {llm_response[:200]}...")
+                analysis = json.loads(json_str)
+                self.logger.debug(f"Parsed analysis: {json.dumps(analysis)[:200]}...")
+                
+                summary = IntervalSummary(
+                    start_time=self.last_summary_time,
+                    end_time=datetime.now(),
+                    key_points=analysis.get('key_points', []),
+                    main_topics=analysis.get('main_topics', []),
+                    important_events=analysis.get('important_events', []),
+                    action_items=analysis.get('action_items', [])
+                )
+                
+                interval_file.write(
+                    f"\n{'='*50}\n"
+                    f"Summary for period: {summary.start_time} to {summary.end_time}\n"
+                    f"{'='*50}\n\n"
+                )
+                
+                interval_file.write("Key Points:\n")
+                for point in summary.key_points:
+                    interval_file.write(f"- {point}\n")
                     
-                    json_str = llm_response[llm_response.find('{'):llm_response.rfind('}')+1]
-                    self.logger.debug(f"Extracted JSON: {json_str[:200]}...")
+                interval_file.write("\nMain Topics:\n")
+                for topic in summary.main_topics:
+                    interval_file.write(f"- {topic}\n")
                     
-                    analysis = json.loads(json_str)
-                    self.logger.debug(f"Parsed analysis: {json.dumps(analysis)[:200]}...")
+                interval_file.write("\nImportant Events:\n")
+                for event in summary.important_events:
+                    interval_file.write(f"- {event}\n")
                     
-                    summary = IntervalSummary(
-                        start_time=self.last_summary_time,
-                        end_time=datetime.now(),
-                        key_points=analysis.get('key_points', []),
-                        main_topics=analysis.get('main_topics', []),
-                        important_events=analysis.get('important_events', []),
-                        action_items=analysis.get('action_items', [])
-                    )
-                    
-                    interval_file.write(
-                        f"\n{'='*50}\n"
-                        f"Summary for period: {summary.start_time} to {summary.end_time}\n"
-                        f"{'='*50}\n\n"
-                    )
-                    
-                    interval_file.write("Key Points:\n")
-                    for point in summary.key_points:
-                        interval_file.write(f"- {point}\n")
-                        
-                    interval_file.write("\nMain Topics:\n")
-                    for topic in summary.main_topics:
-                        interval_file.write(f"- {topic}\n")
-                        
-                    interval_file.write("\nImportant Events:\n")
-                    for event in summary.important_events:
-                        interval_file.write(f"- {event}\n")
-                        
-                    interval_file.write("\nAction Items:\n")
-                    for item in summary.action_items:
-                        interval_file.write(f"- {item}\n")
-                    
-                    interval_file.write("\n")
-                    interval_file.flush()
-                    
-                    current_file.seek(0)
-                    current_file.truncate()
-                    current_file.write(
-                        f"Current Summary (as of {datetime.now()})\n\n"
-                        f"Key Points:\n"
-                    )
-                    for point in summary.key_points:
-                        current_file.write(f"- {point}\n")
-                    current_file.flush()
-                    
-                    self.all_interval_summaries.append(summary)
-                    
-                    self.current_interval_notes = []
-                    
+                interval_file.write("\nAction Items:\n")
+                for item in summary.action_items:
+                    interval_file.write(f"- {item}\n")
+                
+                interval_file.write("\n")
+                interval_file.flush()
+                
+                current_file.seek(0)
+                current_file.truncate()
+                current_file.write(
+                    f"Current Summary (as of {datetime.now()})\n\n"
+                    f"Key Points:\n"
+                )
+                for point in summary.key_points:
+                    current_file.write(f"- {point}\n")
+                current_file.flush()
+                
+                self.all_interval_summaries.append(summary)
+                
+                self.current_interval_notes = []
+                
         except Exception as e:
             self.logger.error(f"Error generating interval summary: {e}", exc_info=True)
 
-    async def _generate_final_report(self, report_file):
+    async def _generate_final_report(self, report_file, websocket):
         """Generate comprehensive final report"""
         try:
             self.logger.info("Generating final report...")
-            async with await self._connect_websocket() as websocket:
-                summaries_text = "\n".join(
-                    f"Period {i+1}: {summary.start_time} to {summary.end_time}\n" +
-                    f"Key Points: {', '.join(summary.key_points)}\n" +
-                    f"Main Topics: {', '.join(summary.main_topics)}\n" +
-                    f"Important Events: {', '.join(summary.important_events)}\n" +
-                    f"Action Items: {', '.join(summary.action_items)}\n"
-                    for i, summary in enumerate(self.all_interval_summaries)
-                )
-                
-                prompt = f"""
-                Create a comprehensive final report from these interval summaries:
+            summaries_text = "\n".join(
+                f"Period {i+1}: {summary.start_time} to {summary.end_time}\n" +
+                f"Key Points: {', '.join(summary.key_points)}\n" +
+                f"Main Topics: {', '.join(summary.main_topics)}\n" +
+                f"Important Events: {', '.join(summary.important_events)}\n" +
+                f"Action Items: {', '.join(summary.action_items)}\n"
+                for i, summary in enumerate(self.all_interval_summaries)
+            )
+            
+            prompt = f"""
+            Create a comprehensive final report from these interval summaries:
 
-                {summaries_text}
+            {summaries_text}
 
-                The report should include:
-                1. Executive Summary
-                2. Key Themes and Patterns
-                3. Timeline of Important Events
-                4. All Action Items
-                5. Conclusions and Next Steps
+            The report should include:
+            1. Executive Summary
+            2. Key Themes and Patterns
+            3. Timeline of Important Events
+            4. All Action Items
+            5. Conclusions and Next Steps
 
-                Format the report in Markdown.
-                """
-                
-                request = {
-                    "type": "universal.create",
-                    "request": {
-                        "eventId": f"report_{datetime.now().timestamp()}",
-                        "provider": "workers-ai",
-                        "endpoint": "@cf/meta/llama-2-7b-chat-int8",
-                        "headers": {
-                            "Authorization": f"Bearer {self.cf_token}",
-                            "Content-Type": "application/json",
-                        },
-                        "query": {
-                            "messages": [{"role": "user", "content": prompt}]
-                        }
+            Format the report in Markdown.
+            """
+            
+            request = {
+                "type": "universal.create",
+                "request": {
+                    "eventId": f"report_{datetime.now().timestamp()}",
+                    "provider": "workers-ai",
+                    "endpoint": "@cf/meta/llama-2-7b-chat-int8",
+                    "headers": {
+                        "Authorization": f"Bearer {self.cf_token}",
+                        "Content-Type": "application/json",
+                    },
+                    "query": {
+                        "messages": [{"role": "user", "content": prompt}]
                     }
                 }
+            }
+            
+            await websocket.send(json.dumps(request))
+            response = json.loads(await websocket.recv())
+            
+            if response["type"] == "universal.created":
+                report_file.write(response["response"]["result"]["response"])
+                report_file.flush()
                 
-                await websocket.send(json.dumps(request))
-                response = json.loads(await websocket.recv())
-                
-                if response["type"] == "universal.created":
-                    report_file.write(response["response"]["result"]["response"])
-                    report_file.flush()
-                    
         except Exception as e:
             self.logger.error(f"Error generating final report: {e}", exc_info=True)
 
-    async def _transcribe_audio(self, audio_chunk):
+    async def _transcribe_audio(self, audio_chunk, websocket):
         """Send audio chunk to Cloudflare AI for transcription"""
         try:
             wav_header = bytes([
@@ -463,84 +461,83 @@ class StreamProcessor:
             audio_base64 = base64.b64encode(audio_data).decode('utf-8')
             
             self.logger.debug("Sending audio chunk for transcription...")
-            async with await self._connect_websocket() as websocket:
-                request = {
-                    "type": "universal.create",
-                    "request": {
-                        "eventId": f"transcribe_{datetime.now().timestamp()}",
-                        "provider": "workers-ai",
-                        "endpoint": "@cf/openai/whisper-large-v3-turbo",
-                        "headers": {
-                            "Authorization": f"Bearer {self.cf_token}",
-                            "Content-Type": "application/json",
-                        },
-                        "query": {
-                            "audio": audio_base64,
-                            "task": "transcribe",
-                            "language": "en",
-                            "vad_filter": "true"
-                        }
+            request = {
+                "type": "universal.create",
+                "request": {
+                    "eventId": f"transcribe_{datetime.now().timestamp()}",
+                    "provider": "workers-ai",
+                    "endpoint": "@cf/openai/whisper-large-v3-turbo",
+                    "headers": {
+                        "Authorization": f"Bearer {self.cf_token}",
+                        "Content-Type": "application/json",
+                    },
+                    "query": {
+                        "audio": audio_base64,
+                        "task": "transcribe",
+                        "language": "en",
+                        "vad_filter": "true"
                     }
                 }
-                
-                self.logger.debug(f"Sending request: {json.dumps(request)[:200]}...")
-                await websocket.send(json.dumps(request))
-                
-                raw_response = await websocket.recv()
-                self.logger.debug(f"Received raw response: {raw_response}")
-                
-                try:
-                    response = json.loads(raw_response)
-                except json.JSONDecodeError as e:
-                    self.logger.error(f"Failed to parse response JSON: {e}")
-                    return ""
-                
-                self.logger.debug(f"Parsed response: {json.dumps(response)}")
-                
-                if response.get("type") == "error":
-                    self.logger.error(f"API returned error: {response.get('error', {}).get('message', 'Unknown error')}")
-                    return ""
-                
-                if response.get("type") == "universal.created":
-                    response_data = response.get("response", {})
-                    result = response_data.get("result", {})
-                    
-                    if isinstance(result, dict):
-                        text = result.get("text", "")
-                        if text:
-                            timestamp = datetime.now()
-                            transcription_data = {
-                                "timestamp": timestamp.isoformat(),
-                                "transcription_info": result.get("transcription_info", {}),
-                                "segments": result.get("segments", []),
-                                "text": text,
-                                "word_count": result.get("word_count", 0)
-                            }
-                            
-                            transcript_json_path = self.subdirs['transcripts'] / "transcript.json"
-                            file_size = os.path.getsize(transcript_json_path)
-                            
-                            with open(transcript_json_path, "a") as f:
-                                if file_size > 3:
-                                    f.write(',\n')
-                                json.dump(transcription_data, f, indent=2)
-                            
-                            self.logger.info(f"Successfully transcribed: {text[:100]}...")
-                            return text
-                        else:
-                            self.logger.warning("Transcription returned empty text")
-                    else:
-                        self.logger.error(f"Unexpected result format: {result}")
-                else:
-                    self.logger.error(f"Unexpected response type: {response.get('type')}")
-                
+            }
+            
+            self.logger.debug(f"Sending request: {json.dumps(request)[:200]}...")
+            await websocket.send(json.dumps(request))
+            
+            raw_response = await websocket.recv()
+            self.logger.debug(f"Received raw response: {raw_response}")
+            
+            try:
+                response = json.loads(raw_response)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Failed to parse response JSON: {e}")
                 return ""
+            
+            self.logger.debug(f"Parsed response: {json.dumps(response)}")
+            
+            if response.get("type") == "error":
+                self.logger.error(f"API returned error: {response.get('error', {}).get('message', 'Unknown error')}")
+                return ""
+            
+            if response.get("type") == "universal.created":
+                response_data = response.get("response", {})
+                result = response_data.get("result", {})
                 
+                if isinstance(result, dict):
+                    text = result.get("text", "")
+                    if text:
+                        timestamp = datetime.now()
+                        transcription_data = {
+                            "timestamp": timestamp.isoformat(),
+                            "transcription_info": result.get("transcription_info", {}),
+                            "segments": result.get("segments", []),
+                            "text": text,
+                            "word_count": result.get("word_count", 0)
+                        }
+                        
+                        transcript_json_path = self.subdirs['transcripts'] / "transcript.json"
+                        file_size = os.path.getsize(transcript_json_path)
+                        
+                        with open(transcript_json_path, "a") as f:
+                            if file_size > 3:
+                                f.write(',\n')
+                            json.dump(transcription_data, f, indent=2)
+                        
+                        self.logger.info(f"Successfully transcribed: {text[:100]}...")
+                        return text
+                    else:
+                        self.logger.warning("Transcription returned empty text")
+                else:
+                    self.logger.error(f"Unexpected result format: {result}")
+            else:
+                self.logger.error(f"Unexpected response type: {response.get('type')}")
+            
+            return ""
+            
         except Exception as e:
             self.logger.error(f"Transcription error: {e}", exc_info=True)
             return ""
 
-    async def _generate_enhanced_notes(self, text: str) -> Optional[Note]:
+    async def _generate_enhanced_notes(self, text: str, websocket) -> Optional[Note]:
         """Generate enhanced notes from transcribed text using Cloudflare AI"""
         try:
             self.logger.debug("Generating enhanced notes...")
@@ -549,70 +546,78 @@ class StreamProcessor:
                 for item in self.context_buffer[-3:]
             )
             
-            async with await self._connect_websocket() as websocket:
-                prompt = f"""
-                Analyze the following transcript in the context of previous content:
+            prompt = f"""
+            Analyze the following transcript in the context of previous content:
 
-                Previous context:
-                {context}
+            Previous context:
+            {context}
 
-                Current content:
-                {text}
+            Current content:
+            {text}
 
-                Please provide a structured analysis including:
-                1. A concise summary
-                2. Category (choose from: information, action, decision, question, or discussion)
-                3. Key points (if any)
-                4. Important entities mentioned (people, organizations, concepts)
-                5. Importance rating (1-5, where 5 is highest)
+            Please provide a structured analysis including:
+            1. A concise summary
+            2. Category (choose from: information, action, decision, question, or discussion)
+            3. Key points (if any)
+            4. Important entities mentioned (people, organizations, concepts)
+            5. Importance rating (1-5, where 5 is highest)
 
-                Format your response as JSON with the following structure:
-                {{
-                    "summary": "...",
-                    "category": "...",
-                    "key_points": ["..."],
-                    "entities": ["..."],
-                    "importance": N
-                }}
-                """
-                
-                request = {
-                    "type": "universal.create",
-                    "request": {
-                        "eventId": f"notes_{datetime.now().timestamp()}",
-                        "provider": "workers-ai",
-                        "endpoint": "@cf/meta/llama-2-7b-chat-int8",
-                        "headers": {
-                            "Authorization": f"Bearer {self.cf_token}",
-                            "Content-Type": "application/json",
-                        },
-                        "query": {
-                            "messages": [{"role": "user", "content": prompt}]
-                        }
+            Format your response as JSON with the following structure:
+            {{
+                "summary": "...",
+                "category": "...",
+                "key_points": ["..."],
+                "entities": ["..."],
+                "importance": N
+            }}
+
+            Only provide the JSON response, no additional text before or after.
+            """
+            
+            request = {
+                "type": "universal.create",
+                "request": {
+                    "eventId": f"notes_{datetime.now().timestamp()}",
+                    "provider": "workers-ai",
+                    "endpoint": "@cf/meta/llama-2-7b-chat-int8",
+                    "headers": {
+                        "Authorization": f"Bearer {self.cf_token}",
+                        "Content-Type": "application/json",
+                    },
+                    "query": {
+                        "messages": [{"role": "user", "content": prompt}]
                     }
                 }
+            }
+            
+            await websocket.send(json.dumps(request))
+            response = json.loads(await websocket.recv())
+            
+            if response["type"] == "universal.created":
+                llm_response = response["response"]["result"]["response"]
+                self.logger.debug(f"Raw LLM response: {llm_response[:200]}...")
                 
-                await websocket.send(json.dumps(request))
-                response = json.loads(await websocket.recv())
-                
-                if response["type"] == "universal.created":
-                    llm_response = response["response"]["result"]["response"]
-                    
+                try:
                     json_str = llm_response[llm_response.find('{'):llm_response.rfind('}')+1]
                     analysis = json.loads(json_str)
                     
-                    return Note(
+                    note = Note(
                         timestamp=datetime.now(),
-                        content=analysis.get('summary', ''),
-                        category=analysis.get('category', 'information'),
-                        key_points=analysis.get('key_points', []),
-                        entities=analysis.get('entities', []),
-                        importance=analysis.get('importance', 1)
+                        content=str(analysis.get('summary', '')),
+                        category=str(analysis.get('category', 'information')),
+                        key_points=[str(kp) for kp in analysis.get('key_points', [])],
+                        entities=[str(e) for e in analysis.get('entities', [])],
+                        importance=max(1, min(5, int(analysis.get('importance', 1))))
                     )
-                return None
-                
+                    return note
+                except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+                    self.logger.error(f"Failed to parse LLM response: {e}")
+                    return None
+            
+            self.logger.error(f"Unexpected response type: {response.get('type')}")
+            return None
         except Exception as e:
-            self.logger.error(f"Note generation error: {e}", exc_info=True)
+            self.logger.error(f"Note generation error: {str(e)}", exc_info=True)
             return None
 
     def _clean_transcript(self, new_text: str) -> str:
@@ -638,6 +643,8 @@ class StreamProcessor:
 
 async def main():
     try:
+        load_dotenv()
+        
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -646,7 +653,12 @@ async def main():
         root_logger = logging.getLogger()
         root_logger.info("Starting application...")
         
-        stream_url = "http://a.files.bbci.co.uk/media/live/manifesto/audio/simulcast/hls/nonuk/sbr_low/ak/bbc_world_service.m3u8"
+        stream_url = os.getenv('STREAM_URL')
+        if not stream_url:
+            root_logger.error("STREAM_URL environment variable is not set")
+            return
+            
+        root_logger.info(f"Using stream URL: {stream_url}")
         processor = StreamProcessor(stream_url, summary_interval_minutes=5)
         await processor.process_stream()
     except KeyboardInterrupt:
