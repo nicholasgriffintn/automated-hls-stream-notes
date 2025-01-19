@@ -117,7 +117,7 @@ class StreamProcessor:
             chunk_size = 16000 * 2 * 15
             audio_buffer = bytearray()
             min_buffer_size = chunk_size
-            overlap_size = chunk_size // 2  # 50% overlap
+            overlap_size = chunk_size // 4  # 25% overlap (3.75 seconds)
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.last_summary_time = datetime.now()
