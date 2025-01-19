@@ -51,11 +51,11 @@ class StreamProcessor:
             subdir.mkdir(exist_ok=True)
         
         self.logger = logging.getLogger(f"StreamProcessor_{stream_timestamp}")
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.ERROR)
         
         if not self.logger.handlers:
             file_handler = logging.FileHandler(self.subdirs['logs'] / "process.log")
-            file_handler.setLevel(logging.DEBUG)
+            file_handler.setLevel(logging.ERROR)
             file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
             file_handler.setFormatter(file_formatter)
             self.logger.addHandler(file_handler)
@@ -124,10 +124,14 @@ class StreamProcessor:
             
             files = {
                 'transcript': self.subdirs['transcripts'] / "transcript.txt",
+                'transcript_json': self.subdirs['transcripts'] / "transcript.json",
                 'interval_summaries': self.subdirs['summaries'] / "interval_summaries.txt",
                 'current_summary': self.subdirs['summaries'] / "current_summary.txt",
                 'final_report': self.subdirs['reports'] / "final_report.md"
             }
+            
+            with open(files['transcript_json'], 'w') as f:
+                f.write('[\n')
             
             metadata = {
                 'stream_url': self.stream_url,
@@ -138,9 +142,12 @@ class StreamProcessor:
                 json.dump(metadata, f, indent=2)
             
             file_handles = {name: file.open('w', encoding='utf-8') 
-                          for name, file in files.items()}
+                          for name, file in files.items() if name != 'transcript_json'}
             
             websocket = await self._connect_websocket()
+            
+            processed_transcripts = set()
+            
             try:
                 while True:
                     try:
@@ -159,30 +166,41 @@ class StreamProcessor:
                                 cleaned_transcription = self._clean_transcript(transcription)
                                 if cleaned_transcription:
                                     self.logger.debug(f"Transcribed text: {cleaned_transcription[:100]}...")
-                                    self.context_buffer.append({
-                                        'timestamp': datetime.now(),
-                                        'text': cleaned_transcription
-                                    })
-                                    self.context_buffer = self.context_buffer[-self.context_window_size:]
                                     
-                                    file_handles['transcript'].write(
-                                        f"{datetime.now()}: {cleaned_transcription}\n")
-                                    file_handles['transcript'].flush()
-                                    
-                                    note = await self._generate_enhanced_notes(cleaned_transcription)
-                                    if note:
-                                        self.current_interval_notes.append(note)
-                            
-                            audio_buffer = audio_buffer[-overlap_size:]
+                                    if not self.context_buffer or cleaned_transcription != self.context_buffer[-1]['text']:
+                                        self.context_buffer.append({
+                                            'timestamp': datetime.now(),
+                                            'text': cleaned_transcription
+                                        })
+                                        self.context_buffer = self.context_buffer[-self.context_window_size:]
+                                        
+                                        file_handles['transcript'].write(
+                                            f"{datetime.now()}: {cleaned_transcription}\n")
+                                        file_handles['transcript'].flush()
+                                
+                        audio_buffer = audio_buffer[-overlap_size:]
                         
                         current_time = datetime.now()
                         
                         if current_time - self.last_summary_time >= self.summary_interval:
                             self.logger.info("Generating interval summary...")
-                            await self._generate_interval_summary(
-                                file_handles['interval_summaries'],
-                                file_handles['current_summary']
-                            )
+                            
+                            new_transcripts = [
+                                transcript for transcript in self.context_buffer 
+                                if transcript['text'] not in processed_transcripts
+                            ]
+                            
+                            for transcript in new_transcripts:
+                                note = await self._generate_enhanced_notes(transcript['text'])
+                                if note:
+                                    self.current_interval_notes.append(note)
+                                processed_transcripts.add(transcript['text'])
+                            
+                            if self.current_interval_notes:
+                                await self._generate_interval_summary(
+                                    file_handles['interval_summaries'],
+                                    file_handles['current_summary']
+                                )
                             self.last_summary_time = current_time
                         
                     except KeyboardInterrupt:
@@ -192,10 +210,33 @@ class StreamProcessor:
                         self.logger.error(f"Error in processing loop: {e}", exc_info=True)
                         break
                 
-                self.logger.info("Generating final report before shutdown...")
+                if self.context_buffer:
+                    self.logger.info("Generating final interval summary...")
+                    
+                    new_transcripts = [
+                        transcript for transcript in self.context_buffer 
+                        if transcript['text'] not in processed_transcripts
+                    ]
+                    
+                    for transcript in new_transcripts:
+                        note = await self._generate_enhanced_notes(transcript['text'])
+                        if note:
+                            self.current_interval_notes.append(note)
+                        processed_transcripts.add(transcript['text'])
+                    
+                    if self.current_interval_notes:
+                        await self._generate_interval_summary(
+                            file_handles['interval_summaries'],
+                            file_handles['current_summary']
+                        )
+                
+                self.logger.info("Generating final report...")
                 await self._generate_final_report(file_handles['final_report'])
                     
             finally:
+                with open(files['transcript_json'], 'a') as f:
+                    f.write('\n]')
+                
                 self.logger.info("Closing file handles...")
                 for fh in file_handles.values():
                     fh.close()
@@ -233,12 +274,19 @@ class StreamProcessor:
             self.logger.info("Generating interval summary...")
             async with await self._connect_websocket() as websocket:
                 notes_text = "\n".join(
-                    f"{note.timestamp}: {note.content}" 
+                    f"Time: {note.timestamp}\n"
+                    f"Content: {note.content}\n"
+                    f"Category: {note.category}\n"
+                    f"Key Points: {', '.join(note.key_points)}\n"
+                    f"Entities: {', '.join(note.entities)}\n"
+                    f"Importance: {note.importance}\n"
                     for note in self.current_interval_notes
                 )
                 
+                self.logger.debug(f"Generating summary from notes: {notes_text[:200]}...")
+                
                 prompt = f"""
-                Analyze the following notes from the last {self.summary_interval.total_seconds() // 60} minutes:
+                Analyze these notes from the last {self.summary_interval.total_seconds() // 60} minutes:
 
                 {notes_text}
 
@@ -278,9 +326,13 @@ class StreamProcessor:
                 
                 if response["type"] == "universal.created":
                     llm_response = response["response"]["result"]["response"]
+                    self.logger.debug(f"Raw LLM response: {llm_response[:200]}...")
                     
                     json_str = llm_response[llm_response.find('{'):llm_response.rfind('}')+1]
+                    self.logger.debug(f"Extracted JSON: {json_str[:200]}...")
+                    
                     analysis = json.loads(json_str)
+                    self.logger.debug(f"Parsed analysis: {json.dumps(analysis)[:200]}...")
                     
                     summary = IntervalSummary(
                         start_time=self.last_summary_time,
@@ -456,6 +508,23 @@ class StreamProcessor:
                     if isinstance(result, dict):
                         text = result.get("text", "")
                         if text:
+                            timestamp = datetime.now()
+                            transcription_data = {
+                                "timestamp": timestamp.isoformat(),
+                                "transcription_info": result.get("transcription_info", {}),
+                                "segments": result.get("segments", []),
+                                "text": text,
+                                "word_count": result.get("word_count", 0)
+                            }
+                            
+                            transcript_json_path = self.subdirs['transcripts'] / "transcript.json"
+                            file_size = os.path.getsize(transcript_json_path)
+                            
+                            with open(transcript_json_path, "a") as f:
+                                if file_size > 3:
+                                    f.write(',\n')
+                                json.dump(transcription_data, f, indent=2)
+                            
                             self.logger.info(f"Successfully transcribed: {text[:100]}...")
                             return text
                         else:
@@ -527,7 +596,11 @@ class StreamProcessor:
                 response = json.loads(await websocket.recv())
                 
                 if response["type"] == "universal.created":
-                    analysis = response["response"]["result"]
+                    llm_response = response["response"]["result"]["response"]
+                    
+                    json_str = llm_response[llm_response.find('{'):llm_response.rfind('}')+1]
+                    analysis = json.loads(json_str)
+                    
                     return Note(
                         timestamp=datetime.now(),
                         content=analysis.get('summary', ''),
