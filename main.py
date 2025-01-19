@@ -319,6 +319,8 @@ class StreamProcessor:
                     "important_events": ["..."],
                     "action_items": ["..."]
                 }}
+                
+                Only provide the JSON response, no additional text before or after.
                 """
                 
                 request = {
