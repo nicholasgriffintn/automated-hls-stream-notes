@@ -1,0 +1,11 @@
+[project]
+name = "automated-hls-stream-notes"
+version = "0.1.0"
+description = "An automated system to generate notes from an HLS video streams"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ffmpeg-python>=0.2.0",
+    "python-dotenv>=1.0.1",
+    "websockets>=14.1",
+]
