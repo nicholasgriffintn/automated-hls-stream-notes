@@ -88,6 +88,8 @@ class StreamProcessor:
         self.context_window_size = 5
         self.empty_chunk_count = 0
         self.max_empty_chunks = 5
+        self.pending_summary_tasks = []
+        self.file_handles = None
         
     async def process_stream(self):
         """Main processing loop"""
@@ -144,6 +146,8 @@ class StreamProcessor:
             file_handles = {name: file.open('w', encoding='utf-8') 
                           for name, file in files.items() if name != 'transcript_json'}
             
+            self.file_handles = file_handles
+            
             websocket = await self._connect_websocket()
             
             processed_transcripts = set()
@@ -161,7 +165,7 @@ class StreamProcessor:
                             if self.empty_chunk_count >= self.max_empty_chunks:
                                 self.logger.error(f"No audio data received for {self.max_empty_chunks} consecutive chunks, stopping...")
                                 break
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(5)
                             continue
                         
                         self.empty_chunk_count = 0
@@ -212,16 +216,14 @@ class StreamProcessor:
                                 notes_to_summarize = self.current_interval_notes.copy()
                                 self.current_interval_notes = []
                                 
-                                asyncio.create_task(self._generate_interval_summary_task(
+                                task = asyncio.create_task(self._generate_interval_summary_task(
                                     notes_to_summarize,
                                     file_handles['interval_summaries'],
                                     file_handles['current_summary']
                                 ))
+                                self.pending_summary_tasks.append(task)
                             self.last_summary_time = current_time
                         
-                    except KeyboardInterrupt:
-                        self.logger.info("Received keyboard interrupt, shutting down gracefully...")
-                        break
                     except Exception as e:
                         self.logger.error(f"Error in processing loop: {e}", exc_info=True)
                         break
@@ -241,22 +243,25 @@ class StreamProcessor:
                         processed_transcripts.add(transcript['text'])
                     
                     if self.current_interval_notes:
-                        await self._generate_interval_summary(
+                        notes_to_summarize = self.current_interval_notes.copy()
+                        self.current_interval_notes = []
+                        
+                        task = asyncio.create_task(self._generate_interval_summary_task(
+                            notes_to_summarize,
                             file_handles['interval_summaries'],
                             file_handles['current_summary']
-                        )
+                        ))
+                        self.pending_summary_tasks.append(task)
                 
-                self.logger.info("Generating final report...")
-                await self._generate_final_report(file_handles['final_report'])
-                    
+                self.logger.info("Waiting for pending summary tasks to complete...")
+                if self.pending_summary_tasks:
+                    await asyncio.gather(*self.pending_summary_tasks)
+                
+            except Exception as e:
+                self.logger.error(f"Error in main processing loop: {e}", exc_info=True)
             finally:
                 with open(files['transcript_json'], 'a') as f:
                     f.write('\n]')
-                
-                self.logger.info("Closing file handles...")
-                for fh in file_handles.values():
-                    fh.close()
-                await websocket.close()
                     
         except Exception as e:
             self.logger.error(f"Error processing stream: {e}", exc_info=True)
@@ -268,6 +273,7 @@ class StreamProcessor:
                     process.kill()
                 except Exception as e:
                     self.logger.warning(f"Error while killing ffmpeg process: {e}", exc_info=True)
+            return file_handles
 
     async def _connect_websocket(self):
         """Helper method to create websocket connection with proper headers"""
@@ -298,8 +304,6 @@ class StreamProcessor:
                     f"Importance: {note.importance}\n"
                     for note in notes
                 )
-                
-                self.logger.debug(f"Generating summary from notes: {notes_text[:200]}...")
                 
                 prompt = f"""
                 Analyze these notes from the last {self.summary_interval.total_seconds() // 60} minutes:
@@ -361,6 +365,9 @@ class StreamProcessor:
                         action_items=analysis.get('action_items', [])
                     )
                     
+                    self.all_interval_summaries.append(summary)
+                    self.logger.info(f"Added interval summary. Total summaries: {len(self.all_interval_summaries)}")
+                    
                     interval_file.write(
                         f"\n{'='*50}\n"
                         f"Summary for period: {summary.start_time} to {summary.end_time}\n"
@@ -395,8 +402,6 @@ class StreamProcessor:
                     for point in summary.key_points:
                         current_file.write(f"- {point}\n")
                     current_file.flush()
-                    
-                    self.all_interval_summaries.append(summary)
         except Exception as e:
             self.logger.error(f"Error generating interval summary: {e}", exc_info=True)
 
@@ -681,20 +686,68 @@ async def main():
         stream_url = os.getenv('STREAM_URL')
         if not stream_url:
             root_logger.error("STREAM_URL environment variable is not set")
-            return
+            return None
             
         root_logger.info(f"Using stream URL: {stream_url}")
-        processor = StreamProcessor(stream_url, summary_interval_minutes=5)
+        processor = StreamProcessor(stream_url, summary_interval_minutes=1)
+        current_task = asyncio.current_task()
+        if current_task:
+            current_task._processor = processor
         await processor.process_stream()
+        return processor
     except KeyboardInterrupt:
-        root_logger.info("Application shutdown requested")
+        root_logger.info("Application shutdown requested...")
+        return processor
     except Exception as e:
         root_logger.error(f"Application error: {e}", exc_info=True)
+        return None
     finally:
         root_logger.info("Application shutdown complete")
 
 if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    processor = None
+    
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+        main_task = loop.create_task(main())
+        try:
+            processor = loop.run_until_complete(main_task)
+        except KeyboardInterrupt:
+            print("\nShutdown requested... Running cleanup")
+            try:
+                processor = loop.run_until_complete(asyncio.wait_for(main_task, timeout=1.0))
+            except (asyncio.TimeoutError, Exception) as e:
+                if hasattr(main_task, '_processor'):
+                    processor = main_task._processor
+                print(f"Note: Cleanup may be incomplete due to: {str(e)}")
+                
+            if processor and processor.all_interval_summaries:
+                print("Generating final report...")
+                report_path = processor.subdirs['reports'] / "final_report.md"
+                with open(report_path, 'w', encoding='utf-8') as report_file:
+                    cleanup_task = loop.create_task(processor._generate_final_report(report_file))
+                    loop.run_until_complete(cleanup_task)
+            else:
+                print("No interval summaries available to generate final report")
+                
+            main_task.cancel()
+            try:
+                loop.run_until_complete(main_task)
+            except asyncio.CancelledError:
+                pass
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        
+        if pending:
+            print("Cleaning up pending tasks...")
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        
+        if processor and processor.file_handles:
+            print("Closing file handles...")
+            for fh in processor.file_handles.values():
+                fh.close()
+        
+        loop.close()
