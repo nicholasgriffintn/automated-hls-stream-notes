@@ -332,7 +332,7 @@ class StreamProcessor:
                     "request": {
                         "eventId": f"summary_{datetime.now().timestamp()}",
                         "provider": "workers-ai",
-                        "endpoint": "@cf/meta/llama-2-7b-chat-int8",
+                        "endpoint": "@cf/meta/llama-3-8b-instruct",
                         "headers": {
                             "Authorization": f"Bearer {self.cf_token}",
                             "Content-Type": "application/json",
@@ -447,7 +447,7 @@ class StreamProcessor:
                   "request": {
                       "eventId": f"report_{datetime.now().timestamp()}",
                       "provider": "workers-ai",
-                      "endpoint": "@cf/meta/llama-2-7b-chat-int8",
+                      "endpoint": "@cf/meta/llama-3-8b-instruct",
                       "headers": {
                           "Authorization": f"Bearer {self.cf_token}",
                           "Content-Type": "application/json",
@@ -615,7 +615,7 @@ class StreamProcessor:
                   "request": {
                       "eventId": f"notes_{datetime.now().timestamp()}",
                       "provider": "workers-ai",
-                      "endpoint": "@cf/meta/llama-2-7b-chat-int8",
+                      "endpoint": "@cf/meta/llama-3-8b-instruct",
                       "headers": {
                           "Authorization": f"Bearer {self.cf_token}",
                           "Content-Type": "application/json",
@@ -698,7 +698,7 @@ async def main():
             return None
             
         root_logger.info(f"Using stream URL: {stream_url}")
-        processor = StreamProcessor(stream_url, summary_interval_minutes=1)
+        processor = StreamProcessor(stream_url, summary_interval_minutes=5)
         current_task = asyncio.current_task()
         if current_task:
             current_task._processor = processor
