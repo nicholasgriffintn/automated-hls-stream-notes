@@ -37,4 +37,4 @@ COPY --chown=appuser:appuser . .
 RUN uv pip install -e .
 
 # Run the application
-CMD ["python", "main.py"] 
+CMD ["python", "src/main.py", ""] 

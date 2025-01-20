@@ -23,7 +23,7 @@ podman run --env-file .env --name automated-hls-stream-notes -v $(pwd):/app -d a
 Or you can run without Podman:
 
 ```bash
-uv run main.py
+uv run src/main.py <stream_url> [output_dir] [summary_interval_minutes]
 ```
 
 You should see the output in the `outputs` directory as it comes in.
