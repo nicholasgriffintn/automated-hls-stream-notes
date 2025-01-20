@@ -338,7 +338,10 @@ class StreamProcessor:
                             "Content-Type": "application/json",
                         },
                         "query": {
-                            "messages": [{"role": "user", "content": prompt}]
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 1024,
+                            "temperature": 0.7,
+                            "top_p": 0.9
                         }
                     }
                 }
@@ -450,7 +453,10 @@ class StreamProcessor:
                           "Content-Type": "application/json",
                       },
                       "query": {
-                          "messages": [{"role": "user", "content": prompt}]
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 2048,
+                          "temperature": 0.7,
+                          "top_p": 0.9
                       }
                   }
               }
@@ -615,7 +621,10 @@ class StreamProcessor:
                           "Content-Type": "application/json",
                       },
                       "query": {
-                          "messages": [{"role": "user", "content": prompt}]
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 512,
+                          "temperature": 0.7,
+                          "top_p": 0.9
                       }
                   }
               }
