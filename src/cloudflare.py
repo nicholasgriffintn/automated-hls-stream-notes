@@ -13,6 +13,14 @@ class CloudflareService:
         self._last_connect_attempt = None
         self._connect_retry_delay = 5
     
+    async def __aenter__(self):
+        """Async context manager entry"""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - ensures websocket is properly closed"""
+        await self.disconnect()
+    
     async def _connect_websocket(self) -> None:
         """Helper method to create websocket connection with proper headers"""
         try:
@@ -22,14 +30,17 @@ class CloudflareService:
                     await pong
                     return
                 except Exception:
+                    self.logger.debug("Ping failed, disconnecting...")
                     await self.disconnect()
             
             now = datetime.now()
             if self._last_connect_attempt and (now - self._last_connect_attempt).total_seconds() < self._connect_retry_delay:
-                self.logger.debug("Waiting before retry...")
-                return
+                wait_time = self._connect_retry_delay - (now - self._last_connect_attempt).total_seconds()
+                if wait_time > 0:
+                    self.logger.debug(f"Waiting {wait_time:.1f}s before connecting...")
+                    await asyncio.sleep(wait_time)
             
-            self._last_connect_attempt = now
+            self._last_connect_attempt = datetime.now()
             self.logger.debug("Connecting to websocket...")
             
             headers = {
@@ -58,13 +69,14 @@ class CloudflareService:
     
     async def _send_request(self, request: dict, retries: int = 3) -> dict:
         """Send a request to Cloudflare AI and get the response"""
-        while retries > 0:
+        attempt = 0
+        while attempt < retries:
+            attempt += 1
             try:
                 await self._connect_websocket()
                 
                 if not self._websocket:
-                    self.logger.error("Failed to establish websocket connection")
-                    return None
+                    raise ConnectionError("Failed to establish websocket connection")
                 
                 self.logger.debug(f"Sending request: {str(request)[:200]}...")
                 await self._websocket.send(json.dumps(request))
@@ -72,29 +84,22 @@ class CloudflareService:
                 raw_response = await self._websocket.recv()
                 self.logger.debug(f"Received raw response: {raw_response}")
                 
-                try:
-                    response = json.loads(raw_response)
-                except json.JSONDecodeError as e:
-                    self.logger.error(f"Failed to parse response JSON: {e}")
-                    await self.disconnect()
-                    return None
-                
+                response = json.loads(raw_response)
                 self.logger.debug(f"Parsed response: {str(response)[:200]}...")
                 
                 if response.get("type") == "error":
-                    self.logger.error(f"API returned error: {response.get('error', {}).get('message', 'Unknown error')}")
-                    await self.disconnect()
-                    return None
+                    raise RuntimeError(f"API returned error: {response.get('error', {}).get('message', 'Unknown error')}")
                 
-                await self.disconnect()
                 return response
                 
             except Exception as e:
-                self.logger.error(f"Error during request (attempt {4-retries}/3): {e}")
+                self.logger.error(f"Error during request: {e}")
                 await self.disconnect()
-                retries -= 1
-                if retries > 0:
-                    self.logger.debug(f"Retrying request... {retries} attempts remaining")
+                
+                if attempt < retries:
+                    self.logger.debug(f"Retrying in {self._connect_retry_delay}s...")
                     await asyncio.sleep(self._connect_retry_delay)
+                else:
+                    self.logger.error("All retry attempts failed")
         
         return None
