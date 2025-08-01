@@ -1,4 +1,5 @@
 > Update: I've made this into an app on my Polychat application, it will transcribe live from a tab so does basically what this does but in a better, unified way. I've archived this as I don't think i'll be working on it.
+> You can find my ai platform here: https://github.com/nicholasgriffintn/ai-platform
 
 # Automated HLS Stream Notes
 
